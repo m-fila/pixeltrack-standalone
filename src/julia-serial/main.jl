@@ -4,6 +4,37 @@ using BenchmarkTools
 using ArgParse
 using Printf
 using Dates
+using CSV
+using DataFrames
+
+function measure_pipeline(ev)
+    stats = @timed run_processor(ev)
+    event_count = ev.source.numEvents[] - 1
+    msg = @sprintf("Pipeline (throughput %.2f events/s)", event_count / stats.time)
+    print_timing(msg, stats)
+    return stats
+end
+
+function print_timing(message, stats)
+    Base.time_print(stdout, stats.time * 1e9, stats.gcstats.allocd,
+        stats.gcstats.total_time,
+        Base.gc_alloc_count(stats.gcstats), stats.lock_conflicts,
+        stats.compile_time * 1e9,
+        stats.recompile_time * 1e9, true; msg=message)
+end
+
+function timings_to_df(stats, event_count, max_concurrent)
+    df = DataFrame(stats)
+    transform!(df, :gcstats => ByRow(x -> x.allocd) => :gc_allocd)
+    transform!(df, :gcstats => ByRow(x -> x.total_time) => :gc_total_time)
+    transform!(df, :gcstats => ByRow(x -> Base.gc_alloc_count(x)) => :gc_alloc_count)
+    transform!(df, :time => ByRow(x -> event_count / x) => :throughput)
+    select!(df, Not([:value, :gcstats]))
+    df.threads .= Threads.nthreads()
+    df.event_count .= event_count
+    df.max_concurrent .= max_concurrent
+    return df
+end
 
 function print_help()
     println("""
@@ -60,6 +91,15 @@ function parse_commandline()
         "-h", "--help"
         help = "Show this help message"
         action = :store_true
+
+        "--save-timing"
+        help = "Output the timing information. Must be a csv file"
+        arg_type = String
+
+        "--trials"
+        help = "Run the pipeline N times"
+        arg_type = Int
+        default = 1
     end
 
     return parse_args(s)
@@ -151,33 +191,15 @@ function julia_main()::Cint
     end
 
     # Main processing
-    println("Processing...")
-    start_time = now()
-    cpu_start = time_ns()
 
-    @time run_processor(ev)
+    stats = [measure_pipeline(ev)]
+    event_count = ev.source.numEvents[] - 1
+    df = timings_to_df(stats, event_count, num_streams)
 
-    cpu_end = time_ns()
-    end_time = now()
-
-    # Calculate timing
-    elapsed_seconds = Dates.value(end_time - start_time) / 1000
-    cpu_time = (cpu_end - cpu_start) / 1e9
-
-    # Report results
-    processed_events = ev.source.numEvents[] - 1  # Adjust this based on your actual event counter
-    throughput = processed_events / elapsed_seconds
-    cpu_usage = (cpu_time / elapsed_seconds / Threads.nthreads()) * 100
-
-    @printf("Processed %d events in %.6e seconds, throughput %.2f events/s, CPU usage per thread: %.1f%%\n",
-        processed_events, elapsed_seconds, throughput, cpu_usage)
-
-    # catch e
-    #     println("\n----------\nCaught exception:")
-    #     println(e)
-    #     return 1
-    # end
-    println("Finished processing events.")
-
+    if !isnothing(args["save-timing"])
+        path = args["save-timing"]
+        CSV.write(path, df)
+        @info "Written timing information to $path"
+    end
     return 0
 end
